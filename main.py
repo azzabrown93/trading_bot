@@ -1,82 +1,187 @@
-import yfinance as yf
-import pandas as pd
-import requests
+import os
 import time
-from ta.trend import EMAIndicator
+import requests
+import pandas as pd
+import yfinance as yf
+
+from ta.trend import EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange
 
 
 # ================= CONFIG =================
 
-SYMBOL = "GC=F"  # Gold futures
-DISCORD_WEBHOOK = "https://discordapp.com/api/webhooks/1472646622021292073/uFperB-67bB3T0zHbiJXzNDniZxwbyOYYTdIn0z_lPIz3zwpSTbC4ipkWqJMceeVzYj0"
-
+SYMBOL = "GC=F"
+SCAN_INTERVAL = 900
+RR_RATIO = 2
 ACCOUNT_BALANCE = 10000
 RISK_PER_TRADE = 0.01
-RR_RATIO = 2
 
-SCAN_INTERVAL = 900  # seconds (15 minutes)
+WEBHOOK = os.getenv("DISCORD_WEBHOOK")
+HEARTBEAT_MINUTES = int(os.getenv("HEARTBEAT_MINUTES", 60))
+
+NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # ==========================================
 
 
-def send_discord(message):
-    payload = {"content": message}
+# ---------- Discord ----------
+
+def send_discord(msg):
+
+    if not WEBHOOK:
+        print("No webhook configured.")
+        return
+
     try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-    except Exception as e:
-        print("Discord error:", e)
+        requests.post(WEBHOOK, json={"content": msg}, timeout=10)
+    except:
+        print("Discord send failed.")
 
 
-def fetch_data(interval, period):
-    df = yf.download(SYMBOL, interval=interval, period=period, progress=False)
-    df.dropna(inplace=True)
-    return df
+# ---------- Heartbeat ----------
+
+last_heartbeat = 0
+
+def heartbeat():
+
+    global last_heartbeat
+
+    if time.time() - last_heartbeat > HEARTBEAT_MINUTES * 60:
+        send_discord("💓 Gold ULTRA Bot is running.")
+        last_heartbeat = time.time()
 
 
-def add_indicators(df):
-    df['EMA50'] = EMAIndicator(df['Close'], window=50).ema_indicator()
-    df['EMA200'] = EMAIndicator(df['Close'], window=200).ema_indicator()
+# ---------- News Filter ----------
 
-    atr = AverageTrueRange(
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close'],
-        window=14
+def high_impact_news_soon():
+
+    try:
+        data = requests.get(NEWS_URL, timeout=10).json()
+
+        now = pd.Timestamp.utcnow()
+
+        for event in data:
+
+            if event.get("impact") != "High":
+                continue
+
+            event_time = pd.Timestamp(event["date"])
+
+            diff = abs((event_time - now).total_seconds()) / 60
+
+            # avoid trading 45 minutes before/after
+            if diff < 45:
+                return True
+
+    except:
+        return False
+
+    return False
+
+
+# ---------- Data ----------
+
+def fetch(interval, period):
+
+    df = yf.download(
+        SYMBOL,
+        interval=interval,
+        period=period,
+        auto_adjust=True,
+        progress=False
     )
 
-    df['ATR'] = atr.average_true_range()
+    if df.empty:
+        raise ValueError("Market data empty.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     return df
 
 
-# -------- Multi-Timeframe Trend --------
+# ---------- Indicators ----------
 
-def trend_direction():
-    h4 = add_indicators(fetch_data("1h", "60d"))
-    m15 = add_indicators(fetch_data("15m", "7d"))
+def indicators(df):
 
-    h4_last = h4.iloc[-1]
-    m15_last = m15.iloc[-1]
+    close = df["Close"].squeeze()
+    high = df["High"].squeeze()
+    low = df["Low"].squeeze()
 
-    bullish_h4 = h4_last['EMA50'] > h4_last['EMA200']
-    bullish_m15 = m15_last['EMA50'] > m15_last['EMA200']
+    df["EMA50"] = EMAIndicator(close, 50).ema_indicator()
+    df["EMA200"] = EMAIndicator(close, 200).ema_indicator()
 
-    bearish_h4 = h4_last['EMA50'] < h4_last['EMA200']
-    bearish_m15 = m15_last['EMA50'] < m15_last['EMA200']
+    df["ATR"] = AverageTrueRange(high, low, close).average_true_range()
+    df["ADX"] = ADXIndicator(high, low, close).adx()
 
-    if bullish_h4 and bullish_m15:
-        return "BUY", m15_last
-    elif bearish_h4 and bearish_m15:
-        return "SELL", m15_last
-    else:
-        return "NONE", m15_last
+    return df
 
 
-# -------- Trade Builder --------
+# ---------- Liquidity Sweep ----------
 
-def build_trade(direction, candle):
-    entry = candle['Close']
-    atr = candle['ATR']
+def liquidity_sweep(df):
+
+    recent_high = df["High"].rolling(20).max().iloc[-2]
+    recent_low = df["Low"].rolling(20).min().iloc[-2]
+
+    last = df.iloc[-1]
+
+    sweep_high = last["High"] > recent_high and last["Close"] < recent_high
+    sweep_low = last["Low"] < recent_low and last["Close"] > recent_low
+
+    return sweep_high or sweep_low
+
+
+# ---------- Trend ----------
+
+def trend():
+
+    h1 = indicators(fetch("1h", "60d"))
+    m15 = indicators(fetch("15m", "7d"))
+
+    h = h1.iloc[-1]
+    m = m15.iloc[-1]
+
+    bullish = h["EMA50"] > h["EMA200"] and m["EMA50"] > m["EMA200"]
+    bearish = h["EMA50"] < h["EMA200"] and m["EMA50"] < m["EMA200"]
+
+    if bullish:
+        return "BUY", m15
+    if bearish:
+        return "SELL", m15
+
+    return "NONE", m15
+
+
+# ---------- Confidence Engine ----------
+
+def confidence(df):
+
+    last = df.iloc[-1]
+
+    score = 50
+
+    if last["ADX"] > 25:
+        score += 20
+
+    atr_percent = (last["ATR"] / last["Close"]) * 100
+    if atr_percent > 0.7:
+        score += 15
+
+    if liquidity_sweep(df):
+        score += 15
+
+    return min(score, 100)
+
+
+# ---------- Trade ----------
+
+def build_trade(direction, df):
+
+    last = df.iloc[-1]
+
+    entry = last["Close"]
+    atr = last["ATR"]
 
     if direction == "BUY":
         stop = entry - atr
@@ -86,91 +191,71 @@ def build_trade(direction, candle):
         target = entry - atr * RR_RATIO
 
     risk_amount = ACCOUNT_BALANCE * RISK_PER_TRADE
-    risk_per_unit = abs(entry - stop)
+    size = risk_amount / abs(entry - stop)
+    profit = abs(target - entry) * size
 
-    position_size = risk_amount / risk_per_unit
-    potential_profit = abs(target - entry) * position_size
+    conf = confidence(df)
 
-    score = trade_score(atr, entry)
-
-    return {
-        "direction": direction,
-        "entry": entry,
-        "stop": stop,
-        "target": target,
-        "size": position_size,
-        "profit": potential_profit,
-        "score": score
-    }
+    return entry, stop, target, size, profit, conf
 
 
-# -------- Trade Quality Score --------
+# ---------- Main Loop ----------
 
-def trade_score(atr, price):
-    volatility_percent = (atr / price) * 100
+def run():
 
-    if volatility_percent > 1.2:
-        return "A+ (High momentum)"
-    elif volatility_percent > 0.8:
-        return "A (Tradable)"
-    elif volatility_percent > 0.5:
-        return "B (Moderate)"
-    else:
-        return "C (Low volatility)"
-
-
-# -------- Format Alert --------
-
-def format_alert(trade):
-    return f"""
-🚨 GOLD TRADE SIGNAL 🚨
-
-Direction: **{trade['direction']}**
-Entry: {trade['entry']:.2f}
-Stop Loss: {trade['stop']:.2f}
-Take Profit: {trade['target']:.2f}
-
-Position Size: {trade['size']:.3f}
-Potential Profit: ${trade['profit']:.2f}
-
-Trade Quality: {trade['score']}
-Risk:Reward = 1:{RR_RATIO}
-"""
-
-
-# -------- Main Scanner Loop --------
-
-def run_bot():
-    print("Gold bot running...")
+    send_discord("🚀 Gold ULTRA Bot deployed and running.")
 
     last_signal = None
 
     while True:
+
         try:
-            direction, candle = trend_direction()
 
-            if direction != "NONE":
-                trade = build_trade(direction, candle)
+            heartbeat()
 
-                signal_id = f"{direction}-{round(trade['entry'],2)}"
+            if high_impact_news_soon():
+                print("High impact news soon — skipping trades.")
+                time.sleep(600)
+                continue
 
-                # Prevent duplicate spam
-                if signal_id != last_signal:
-                    alert = format_alert(trade)
+            direction, df = trend()
 
-                    print(alert)
-                    send_discord(alert)
+            if direction == "NONE":
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-                    last_signal = signal_id
+            entry, stop, target, size, profit, conf = build_trade(direction, df)
 
-            else:
-                print("No aligned trend...")
+            signal_id = f"{direction}-{round(entry,1)}"
+
+            if signal_id != last_signal and conf >= 75:
+
+                msg = f"""
+🔥 **ULTRA GOLD SIGNAL**
+
+Direction: {direction}
+Entry: {entry:.2f}
+Stop: {stop:.2f}
+Target: {target:.2f}
+
+Confidence: {conf}/100
+
+Position Size: {size:.3f}
+Potential Profit: ${profit:.2f}
+
+Bot Status: ACTIVE ✅
+"""
+
+                send_discord(msg)
+                last_signal = signal_id
 
         except Exception as e:
-            print("Bot error:", e)
+
+            send_discord(f"🚨 BOT CRASHED 🚨\n{str(e)}")
+            time.sleep(60)
 
         time.sleep(SCAN_INTERVAL)
 
 
 if __name__ == "__main__":
-    run_bot()
+    run()
