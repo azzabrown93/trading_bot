@@ -11,6 +11,8 @@ from ta.trend import EMAIndicator, ADXIndicator
 from ta.volatility import AverageTrueRange
 
 
+# ================= CONFIG =================
+
 SYMBOL = "GC=F"
 WEBHOOK = os.getenv("DISCORD_WEBHOOK")
 
@@ -20,6 +22,9 @@ HEARTBEAT_MINUTES = 60
 ACCOUNT_SIZE = 10000
 RISK_PER_TRADE = 0.01
 RR = 2.5
+
+ADX_THRESHOLD = 32
+STOP_MULTIPLIER = 1.5
 
 NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
@@ -34,7 +39,7 @@ def send(msg):
         try:
             requests.post(WEBHOOK, json={"content": msg}, timeout=10)
         except:
-            print("Discord failed")
+            print("Discord send failed")
 
 
 # ================= DATA SAFETY =================
@@ -54,6 +59,9 @@ def fetch(interval="15m", period="60d"):
         auto_adjust=True,
         progress=False
     )
+
+    if df.empty:
+        raise ValueError("Market data empty.")
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -95,6 +103,7 @@ def high_news():
                 continue
 
             diff = abs((pd.Timestamp(e["date"]) - now).total_seconds()) / 60
+
             if diff < 45:
                 return True
     except:
@@ -122,24 +131,44 @@ def trend():
     return "NONE", m15
 
 
-# ================= POSITION SCIENCE =================
+# ================= TRADE ENGINE =================
+
+def ema_slope_ok(df, direction):
+
+    ema_now = df["EMA50"].iloc[-1]
+    ema_prev = df["EMA50"].iloc[-5]
+
+    if direction == "BUY":
+        return ema_now > ema_prev
+
+    return ema_now < ema_prev
+
 
 def build_trade(direction, df):
 
     last = df.iloc[-1]
 
+    # 🔥 HARD TREND FILTER
+    if last["ADX"] < ADX_THRESHOLD:
+        return None
+
+    if not ema_slope_ok(df, direction):
+        return None
+
     entry = last["Close"]
     atr = last["ATR"]
 
-    stop = entry - atr if direction == "BUY" else entry + atr
-    target = entry + atr * RR if direction == "BUY" else entry - atr * RR
+    stop_distance = atr * STOP_MULTIPLIER
+
+    stop = entry - stop_distance if direction == "BUY" else entry + stop_distance
+    target = entry + stop_distance * RR if direction == "BUY" else entry - stop_distance * RR
 
     risk_amount = ACCOUNT_SIZE * RISK_PER_TRADE
-    size = risk_amount / abs(entry - stop)
+    size = risk_amount / stop_distance
 
     rr_real = abs(target - entry) / abs(entry - stop)
 
-    confidence = min(100, 50 + (last["ADX"] - 20) * 2)
+    confidence = min(100, 60 + (last["ADX"] - 25) * 2)
 
     return entry, stop, target, size, rr_real, confidence
 
@@ -148,25 +177,36 @@ def build_trade(direction, df):
 
 def backtest():
 
-    df = add_indicators(fetch("1h", "120d"))
+    df = add_indicators(fetch("1h", "180d"))
 
     wins = 0
     losses = 0
 
-    for i in range(200, len(df) - 10):
+    for i in range(200, len(df) - 12):
 
         row = df.iloc[i]
 
+        # trend
         if row["EMA50"] <= row["EMA200"]:
+            continue
+
+        # 🔥 SAME FILTERS AS LIVE
+        if row["ADX"] < ADX_THRESHOLD:
+            continue
+
+        ema_now = df["EMA50"].iloc[i]
+        ema_prev = df["EMA50"].iloc[i-5]
+
+        if ema_now <= ema_prev:
             continue
 
         entry = row["Close"]
         atr = row["ATR"]
 
-        stop = entry - atr
-        target = entry + atr * RR
+        stop = entry - atr * STOP_MULTIPLIER
+        target = entry + atr * STOP_MULTIPLIER * RR
 
-        future = df.iloc[i:i+10]
+        future = df.iloc[i:i+12]
 
         if future["Low"].min() <= stop:
             losses += 1
@@ -182,23 +222,27 @@ def backtest():
     expectancy = (winrate/100 * RR) - ((1 - winrate/100) * 1)
 
     send(f"""
-📊 DAILY BACKTEST REPORT
+📊 DAILY STRATEGY REPORT
 
 Win Rate: {winrate:.1f}%
 RR: {RR}
 Expectancy: {expectancy:.2f}
 
 Trades Tested: {total}
+
+ADX Filter: {ADX_THRESHOLD}
+ATR Stop Multiplier: {STOP_MULTIPLIER}
 """)
 
 
 # ================= HEARTBEAT =================
 
 def heartbeat():
+
     global last_heartbeat
 
     if time.time() - last_heartbeat > HEARTBEAT_MINUTES * 60:
-        send("💓 God-Tier Gold Bot alive.")
+        send("💓 Institutional Gold Bot alive.")
         last_heartbeat = time.time()
 
 
@@ -207,14 +251,17 @@ def heartbeat():
 def run():
 
     send("""
-🚀 GOD-TIER GOLD BOT ONLINE
+🚀 INSTITUTIONAL GOLD BOT ONLINE
 
-Institutional Scanner Active.
-Risk Engine Running.
-Research Engine Running.
+Trend Engine ✅
+Risk Engine ✅
+Research Engine ✅
+Filters Active ✅
 """)
 
     last_backtest_day = None
+
+    global last_signal
 
     while True:
 
@@ -238,9 +285,14 @@ Research Engine Running.
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            entry, stop, target, size, rr_real, confidence = build_trade(direction, df)
+            trade = build_trade(direction, df)
 
-            global last_signal
+            if trade is None:
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            entry, stop, target, size, rr_real, confidence = trade
+
             sig_id = f"{direction}-{round(entry,1)}"
 
             if sig_id != last_signal and confidence > 70:
@@ -259,6 +311,11 @@ Risk: {RISK_PER_TRADE*100:.1f}%
 
 R:R: {rr_real:.2f}
 Confidence: {confidence:.0f}/100
+
+Filters Passed:
+ADX > {ADX_THRESHOLD}
+ATR Stop x{STOP_MULTIPLIER}
+EMA Slope Confirmed
 """)
 
                 last_signal = sig_id
